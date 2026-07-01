@@ -1,14 +1,21 @@
 //! Tajima's D statistic in fixed-width windows from VCF.
 //!
-//! Implements vcftools `--TajimaD` exactly:
-//! - Non-overlapping windows of `window_size` bp per chromosome.
-//! - BIN_START = floor(pos / window_size) × window_size (0-based; sites at exact multiples of W go into the higher bin).
-//! - Tajima's π per site: `(2n/(2n−1)) × 2p(1−p)` (only polymorphic sites).
-//! - Watterson's θ_W = S / a₁ where a₁ = Σ(1/i) for i=1..2n−1, 2n = haplotype count.
-//! - D = (π_sum − θ_W) / sqrt(e₁·S + e₂·S·(S−1))
-//!   using Tajima (1989) variance coefficients e₁, e₂.
+//! Reproduces vcftools `--TajimaD` exactly, including its whole-file constant
+//! sample size:
+//! - `n` = 2 × (number of samples), fixed for the entire file. Every variance
+//!   coefficient (a1, a2, b1, b2, c1, c2, e1, e2) is derived from this constant
+//!   n, never from a per-site called-chromosome count.
+//! - Only biallelic (single concrete ALT), fully diploid sites participate. A
+//!   site with any haploid genotype is skipped; a polyploid genotype aborts.
+//! - Per site: `p = ref_count / non_missing_chr`; a site contributes to a bin
+//!   only when `0 < p < 1`, adding `p(1−p)` and incrementing the SNP count.
+//! - Per window: `π = 2·Σp(1−p)·n/(n−1)`, `θ_W = S/a1`,
+//!   `D = (π − θ_W) / sqrt(e1·S + e2·S·(S−1))`.
 //!
-//! Windows with fewer than 2 segregating sites return NaN for D (matching vcftools).
+//! Binning: `BIN_START = floor(pos/W)·W`, computed as `(pos·(1/W)) as u64` to
+//! match vcftools' floating-point truncation. Once the first SNP-bearing bin of
+//! a chromosome is emitted, every subsequent bin up to the last biallelic-diploid
+//! site is emitted too — empty windows in that span carry `N_SNPS=0` and `nan`.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
@@ -17,8 +24,6 @@ use std::path::Path;
 use flate2::read::MultiGzDecoder;
 use rsomics_common::{Result, RsomicsError};
 use serde::Serialize;
-
-// ── Output row ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TajimaDRow {
@@ -29,7 +34,6 @@ pub struct TajimaDRow {
 }
 
 impl TajimaDRow {
-    /// Render as the tab-separated line vcftools emits.
     pub fn to_text(&self) -> String {
         format!(
             "{}\t{}\t{}\t{}\n",
@@ -41,183 +45,183 @@ impl TajimaDRow {
     }
 }
 
-/// Format like vcftools `%g` (6 significant figures, no trailing zeros/dot).
+/// Render `x` exactly as C `printf("%g", x)` (default precision 6), matching the
+/// C++ ostream default float format vcftools writes with.
 pub fn format_g(x: f64) -> String {
     if x.is_nan() {
         return "nan".to_string();
     }
     if x.is_infinite() {
-        return if x > 0.0 {
-            "inf".to_string()
-        } else {
-            "-inf".to_string()
-        };
+        return if x < 0.0 { "-inf" } else { "inf" }.to_string();
     }
-    if x == 0.0 {
-        return "0".to_string();
-    }
-    let mag = x.abs().log10().floor() as i32;
-    let dec = (5 - mag).max(0) as usize;
-    let s = format!("{x:.dec$}");
-    let s = s.trim_end_matches('0').trim_end_matches('.');
-    s.to_string()
+    format_g_prec(x, 6)
 }
 
-// ── Tajima coefficients for a given haplotype count ─────────────────────────
+fn format_g_prec(x: f64, prec: usize) -> String {
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0" } else { "0" }.to_string();
+    }
 
-/// Precomputed Tajima (1989) variance coefficients for a given 2n.
-struct TajimaCoeffs {
+    let sig = prec.max(1);
+    let sci = format!("{:.*e}", sig - 1, x);
+    let epos = sci.find('e').unwrap();
+    let exp: i32 = sci[epos + 1..].parse().unwrap();
+
+    if exp < -4 || exp >= sig as i32 {
+        let mantissa = sci[..epos].trim_end_matches('0').trim_end_matches('.');
+        format!(
+            "{mantissa}e{}{:02}",
+            if exp < 0 { '-' } else { '+' },
+            exp.abs()
+        )
+    } else {
+        let decimals = (sig as i32 - 1 - exp).max(0) as usize;
+        let s = format!("{x:.decimals$}");
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s
+        }
+    }
+}
+
+/// Whole-file Tajima variance coefficients, derived once from the constant
+/// chromosome count `n = 2 × samples`.
+struct Coeffs {
+    a1: f64,
     e1: f64,
     e2: f64,
+    n: f64,
 }
 
-impl TajimaCoeffs {
-    fn new(two_n: u64) -> Self {
-        let n = two_n as f64;
-        let a1: f64 = (1..two_n).map(|i| 1.0 / i as f64).sum();
-        let a2: f64 = (1..two_n).map(|i| 1.0 / (i as f64).powi(2)).sum();
-        let b1 = (n + 1.0) / (3.0 * (n - 1.0));
-        let b2 = 2.0 * (n * n + n + 3.0) / (9.0 * n * (n - 1.0));
+impl Coeffs {
+    fn new(n: u64) -> Self {
+        let nf = n as f64;
+        let a1: f64 = (1..n).map(|i| 1.0 / i as f64).sum();
+        let a2: f64 = (1..n).map(|i| 1.0 / (i as f64 * i as f64)).sum();
+        let b1 = (nf + 1.0) / 3.0 / (nf - 1.0);
+        let b2 = 2.0 * (nf * nf + nf + 3.0) / 9.0 / nf / (nf - 1.0);
         let c1 = b1 - 1.0 / a1;
-        let c2 = b2 - (n + 2.0) / (a1 * n) + a2 / (a1 * a1);
+        let c2 = b2 - (nf + 2.0) / (a1 * nf) + a2 / a1 / a1;
         let e1 = c1 / a1;
         let e2 = c2 / (a1 * a1 + a2);
-        Self { e1, e2 }
+        Self { a1, e1, e2, n: nf }
+    }
+
+    fn tajima_d(&self, sum_pq: f64, s: u64) -> f64 {
+        if s == 0 {
+            return f64::NAN;
+        }
+        let sf = s as f64;
+        let pi = 2.0 * sum_pq * self.n / (self.n - 1.0);
+        let tw = sf / self.a1;
+        let var = self.e1 * sf + self.e2 * sf * (sf - 1.0);
+        (pi - tw) / var.sqrt()
     }
 }
 
-/// Compute Tajima's D from π_sum, S segregating sites, and 2n haplotypes.
-///
-/// Returns NaN when variance is zero (S=0 or S=1 with e2·0=0 → e1·S).
-pub fn tajima_d(pi_sum: f64, s: u64, two_n: u64) -> f64 {
-    if s == 0 || two_n < 2 {
+/// Standalone Tajima's D for the given accumulated Σp(1−p), segregating-site
+/// count, and constant chromosome count `n`.
+pub fn tajima_d(sum_pq: f64, s: u64, n: u64) -> f64 {
+    if n < 2 {
         return f64::NAN;
     }
-    let a1: f64 = (1..two_n).map(|i| 1.0 / i as f64).sum();
-    let theta_w = s as f64 / a1;
-    let coeffs = TajimaCoeffs::new(two_n);
-    let v = coeffs.e1 * s as f64 + coeffs.e2 * s as f64 * (s as f64 - 1.0);
-    if v <= 0.0 {
-        return f64::NAN;
-    }
-    (pi_sum - theta_w) / v.sqrt()
+    Coeffs::new(n).tajima_d(sum_pq, s)
 }
 
-// ── Window accumulator ───────────────────────────────────────────────────────
-
-/// Per-bin accumulator: (pi_sum, segregating_sites, haplotype_count_of_first_site).
-/// vcftools uses the haplotype count from the first site in each window.
-struct BinAcc {
-    pi_sum: f64,
-    n_snps: u64,
-    two_n: u64,
+/// Outcome of scanning one biallelic site's genotypes.
+enum SiteScan {
+    /// Site is not fully diploid (a haploid genotype present) — skip entirely.
+    NotDiploid,
+    /// Site is diploid: reference-allele count and non-missing chromosome count.
+    Diploid { ref_count: u64, non_missing: u64 },
+    /// A polyploid genotype — vcftools aborts here.
+    Polyploid,
 }
 
-struct WindowAcc {
-    window_size: u64,
-    cur_chrom: String,
-    rows: Vec<TajimaDRow>,
-    bins: HashMap<u64, BinAcc>,
-    max_bin: Option<u64>,
+/// Locate the GT sub-field index within a FORMAT string.
+fn gt_index(format: &str) -> usize {
+    format.split(':').position(|k| k == "GT").unwrap_or(0)
 }
 
-impl WindowAcc {
-    fn new(window_size: u64) -> Self {
-        Self {
-            window_size,
-            cur_chrom: String::new(),
-            rows: Vec::new(),
-            bins: HashMap::new(),
-            max_bin: None,
-        }
-    }
-
-    fn bin_of(&self, pos: u64) -> u64 {
-        // vcftools: BIN_START = floor(pos/W)*W  (0-indexed bins at multiples of W)
-        (pos / self.window_size) * self.window_size
-    }
-
-    fn flush_chrom(&mut self) {
-        if self.cur_chrom.is_empty() {
-            return;
-        }
-        let Some(max_bin) = self.max_bin else {
-            return;
-        };
-        // Emit only bins that had at least one SNP.
-        let mut bin_keys: Vec<u64> = self.bins.keys().copied().collect();
-        bin_keys.sort_unstable();
-        for k in bin_keys {
-            let acc = &self.bins[&k];
-            let d = tajima_d(acc.pi_sum, acc.n_snps, acc.two_n);
-            self.rows.push(TajimaDRow {
-                chrom: self.cur_chrom.clone(),
-                bin_start: k,
-                n_snps: acc.n_snps,
-                tajima_d: d,
-            });
-        }
-        let _ = max_bin;
-        self.bins.clear();
-        self.max_bin = None;
-    }
-
-    fn push_site(&mut self, chrom: &str, pos: u64, pi_site: f64, two_n: u64) {
-        if chrom != self.cur_chrom {
-            self.flush_chrom();
-            self.cur_chrom = chrom.to_string();
-        }
-        let k = self.bin_of(pos);
-        let e = self.bins.entry(k).or_insert(BinAcc {
-            pi_sum: 0.0,
-            n_snps: 0,
-            two_n,
-        });
-        e.pi_sum += pi_site;
-        e.n_snps += 1;
-        self.max_bin = Some(self.max_bin.map_or(k, |m| m.max(k)));
-    }
-
-    fn finish(mut self) -> Vec<TajimaDRow> {
-        self.flush_chrom();
-        self.rows
-    }
-}
-
-// ── Per-site π and haplotype count ───────────────────────────────────────────
-
-/// Compute per-site π (Tajima's estimator) and haplotype count from genotype fields.
-/// Returns `None` when fewer than 2 called haplotypes.
-/// Returns `Some((0.0, two_n))` for monomorphic (all-REF or all-ALT) sites.
-pub fn site_pi_with_n(gt_fields: &[&str]) -> Option<(f64, u64)> {
-    let mut n_ref: u64 = 0;
-    let mut n_alt: u64 = 0;
+/// Scan a site's genotype fields, mirroring vcftools' allele accounting.
+fn scan_site(gt_fields: &[&str], gt_idx: usize) -> SiteScan {
+    let mut ref_count = 0u64;
+    let mut non_missing = 0u64;
     for field in gt_fields {
-        let gt = if let Some(c) = field.find(':') {
-            &field[..c]
-        } else {
-            field
-        };
-        for a in gt.split(['/', '|']) {
-            match a {
-                "0" => n_ref += 1,
-                "." => {}
-                _ if a.parse::<u64>().is_ok_and(|v| v > 0) => n_alt += 1,
-                _ => {}
+        let gt = field.split(':').nth(gt_idx).unwrap_or("");
+        let sep_count = gt.bytes().filter(|&b| b == b'/' || b == b'|').count();
+        match sep_count {
+            0 => return SiteScan::NotDiploid,
+            1 => {}
+            _ => return SiteScan::Polyploid,
+        }
+        for allele in gt.split(['/', '|']) {
+            if allele == "." {
+                continue;
+            }
+            non_missing += 1;
+            if allele == "0" {
+                ref_count += 1;
             }
         }
     }
-    let two_n = n_ref + n_alt;
-    if two_n < 2 {
-        return None;
+    SiteScan::Diploid {
+        ref_count,
+        non_missing,
     }
-    let p = n_alt as f64 / two_n as f64;
-    let q = 1.0 - p;
-    let pi = (two_n as f64 / (two_n - 1) as f64) * 2.0 * p * q;
-    Some((pi, two_n))
 }
 
-// ── VCF scanner ─────────────────────────────────────────────────────────────
+/// Per-chromosome bins, indexed by window index; each is (S, Σp(1−p)).
+struct Bins {
+    chrom_order: Vec<String>,
+    prev_chrom: Option<String>,
+    map: HashMap<String, Vec<(u64, f64)>>,
+}
+
+impl Bins {
+    fn new() -> Self {
+        Self {
+            chrom_order: Vec::new(),
+            prev_chrom: None,
+            map: HashMap::new(),
+        }
+    }
+
+    fn touch(&mut self, chrom: &str, idx: usize) -> &mut (u64, f64) {
+        let bins = self.map.entry(chrom.to_string()).or_default();
+        if idx >= bins.len() {
+            bins.resize(idx + 1, (0, 0.0));
+        }
+        if self.prev_chrom.as_deref() != Some(chrom) {
+            self.chrom_order.push(chrom.to_string());
+            self.prev_chrom = Some(chrom.to_string());
+        }
+        &mut bins[idx]
+    }
+
+    fn into_rows(self, coeffs: &Coeffs, window_size: u64) -> Vec<TajimaDRow> {
+        let mut rows = Vec::new();
+        for chrom in &self.chrom_order {
+            let bins = &self.map[chrom];
+            let mut started = false;
+            for (s, (n_snps, sum_pq)) in bins.iter().enumerate() {
+                if *n_snps > 0 {
+                    started = true;
+                }
+                if started {
+                    rows.push(TajimaDRow {
+                        chrom: chrom.clone(),
+                        bin_start: s as u64 * window_size,
+                        n_snps: *n_snps,
+                        tajima_d: coeffs.tajima_d(*sum_pq, *n_snps),
+                    });
+                }
+            }
+        }
+        rows
+    }
+}
 
 fn open_reader(path: &Path) -> Result<Box<dyn Read>> {
     let file = std::fs::File::open(path).map_err(|e| {
@@ -240,28 +244,52 @@ const FIRST_SAMPLE: usize = 9;
 const COL_CHROM: usize = 0;
 const COL_POS: usize = 1;
 const COL_ALT: usize = 4;
+const COL_FORMAT: usize = 8;
 
 pub fn compute_tajima_d(path: &Path, window_size: u64) -> Result<Vec<TajimaDRow>> {
     let reader = open_reader(path)?;
-    let mut lines = BufReader::new(reader).lines();
-    let mut acc = WindowAcc::new(window_size);
-    let mut found_chrom = false;
+    compute_tajima_d_reader(reader, window_size)
+}
 
-    for line in lines.by_ref() {
+/// Core computation over any byte source (plain-text VCF). `compute_tajima_d`
+/// wraps this after transparently opening plain or gzip files.
+pub fn compute_tajima_d_reader<R: Read>(reader: R, window_size: u64) -> Result<Vec<TajimaDRow>> {
+    if window_size == 0 {
+        return Err(RsomicsError::InvalidInput(
+            "window size must be positive".into(),
+        ));
+    }
+    let lines = BufReader::new(reader).lines();
+
+    let mut n_samples: Option<usize> = None;
+    let mut coeffs: Option<Coeffs> = None;
+    let mut bins = Bins::new();
+    let inv_w = 1.0 / window_size as f64;
+
+    for line in lines {
         let line = line?;
         let line = line.trim_end_matches('\r');
         if line.starts_with("##") {
             continue;
         }
         if line.starts_with('#') {
-            found_chrom = true;
+            let cols = line.split('\t').count();
+            let samples = cols.saturating_sub(FIRST_SAMPLE);
+            if samples * 2 < 2 {
+                return Err(RsomicsError::InvalidInput(
+                    "VCF has fewer than two chromosomes (need at least one sample)".into(),
+                ));
+            }
+            n_samples = Some(samples);
+            coeffs = Some(Coeffs::new(samples as u64 * 2));
             continue;
         }
-        if !found_chrom {
+        if n_samples.is_none() {
             return Err(RsomicsError::InvalidInput(
                 "VCF missing #CHROM header line".into(),
             ));
         }
+
         let cols: Vec<&str> = line.split('\t').collect();
         if cols.len() <= FIRST_SAMPLE {
             continue;
@@ -275,21 +303,32 @@ pub fn compute_tajima_d(path: &Path, window_size: u64) -> Result<Vec<TajimaDRow>
             Err(_) => continue,
         };
         let chrom = cols[COL_CHROM];
-        let gt_fields = &cols[FIRST_SAMPLE..];
-        if let Some((pi, two_n)) = site_pi_with_n(gt_fields) {
-            // Only polymorphic sites (pi > 0) contribute to N_SNPS.
-            if pi > 0.0 {
-                acc.push_site(chrom, pos, pi, two_n);
+        let gt_idx = gt_index(cols[COL_FORMAT]);
+        let (ref_count, non_missing) = match scan_site(&cols[FIRST_SAMPLE..], gt_idx) {
+            SiteScan::NotDiploid => continue,
+            SiteScan::Polyploid => {
+                return Err(RsomicsError::InvalidInput(format!(
+                    "polyploidy found, not supported: {chrom}:{pos}"
+                )));
             }
+            SiteScan::Diploid {
+                ref_count,
+                non_missing,
+            } => (ref_count, non_missing),
+        };
+
+        let idx = (pos as f64 * inv_w) as usize;
+        let p = ref_count as f64 / non_missing as f64;
+        let bin = bins.touch(chrom, idx);
+        if p > 0.0 && p < 1.0 {
+            bin.0 += 1;
+            bin.1 += p * (1.0 - p);
         }
     }
 
-    if !found_chrom {
-        return Err(RsomicsError::InvalidInput(
-            "VCF missing #CHROM header line".into(),
-        ));
-    }
-    Ok(acc.finish())
+    let coeffs = coeffs
+        .ok_or_else(|| RsomicsError::InvalidInput("VCF missing #CHROM header line".into()))?;
+    Ok(bins.into_rows(&coeffs, window_size))
 }
 
 pub fn header() -> &'static str {
@@ -301,35 +340,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_g_zero() {
+    fn format_g_matches_printf() {
         assert_eq!(format_g(0.0), "0");
-    }
-
-    #[test]
-    fn format_g_nan() {
         assert_eq!(format_g(f64::NAN), "nan");
+        assert_eq!(format_g(f64::INFINITY), "inf");
+        assert_eq!(format_g(f64::NEG_INFINITY), "-inf");
+        assert_eq!(format_g(1.4450969118871448), "1.4451");
+        assert_eq!(format_g(0.9417745826447361), "0.941775");
+        assert_eq!(format_g(-1.51284), "-1.51284");
+        assert_eq!(format_g(0.0709896), "0.0709896");
     }
 
     #[test]
-    fn tajima_d_window1() {
-        // n=3 samples → 2n=6; S=2; pi_sum=0.6+0.6=1.2
-        let d = tajima_d(1.2, 2, 6);
-        // Expected: 1.75324
-        assert!((d - 1.75324).abs() < 1e-5, "d={d}");
+    fn tajima_d_single_sample_is_nan() {
+        // n = 2 → e1 = e2 = 0 → variance 0 → nan.
+        assert!(tajima_d(0.25, 1, 2).is_nan());
     }
 
     #[test]
-    fn tajima_d_window2() {
-        // n=3 samples → 2n=6; S=1; pi = (6/5)*2*(5/6)*(1/6) = 1/3
-        let pi = (6.0_f64 / 5.0) * 2.0 * (5.0 / 6.0) * (1.0 / 6.0);
-        let d = tajima_d(pi, 1, 6);
-        // Expected: -0.933021
-        assert!((d - (-0.933021)).abs() < 1e-6, "d={d}");
-    }
-
-    #[test]
-    fn tajima_d_zero_snps_is_nan() {
-        let d = tajima_d(0.0, 0, 6);
-        assert!(d.is_nan());
+    fn tajima_d_zero_sites_is_nan() {
+        assert!(tajima_d(0.0, 0, 6).is_nan());
     }
 }

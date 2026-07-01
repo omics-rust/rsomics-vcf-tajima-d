@@ -1,126 +1,159 @@
-//! Value-exact compatibility with vcftools 0.1.17 --TajimaD.
+//! Value-exact compatibility with vcftools 0.1.17 `--TajimaD`.
 //!
-//! All expected output is frozen from black-box observation of vcftools 0.1.17.
-//! No vcftools binary is required at test time; a second section gates on
-//! vcftools being on PATH (version 0.1.17) for live oracle comparison.
+//! Every `expected` string below was captured verbatim from vcftools 0.1.17 on
+//! crafted inputs and frozen as a constant. No oracle binary, interpreter, or
+//! filesystem is touched at test time — inputs feed `compute_tajima_d_reader`
+//! straight from in-memory bytes.
+//!
+//! Cases deliberately span the edges the original golden set omitted: missing
+//! genotypes (`./.`), half-calls (`0/.`), phased genotypes, bare-`.` haploid
+//! sites, all-missing sites, empty/gap and trailing windows (`nan`),
+//! monomorphic and multiallelic sites, `ALT=.`, single/two/many-sample files,
+//! low frequencies, and a `GT:DP` FORMAT.
 
-use std::io::Write;
-use std::path::PathBuf;
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use rsomics_vcf_tajima_d::{compute_tajima_d_reader, header};
 
-use rsomics_vcf_tajima_d::{compute_tajima_d, header};
-
-/// Three-sample VCF: two sites in bin 0 (pos 100, 200), one in bin 1000 (pos 1100).
-const TEST_VCF: &str = "\
-##fileformat=VCFv4.1\n\
-#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\n\
-chr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t0/0\t0/1\t1/1\n\
-chr1\t200\t.\tG\tC\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\n\
-chr1\t1100\t.\tC\tT\t60\tPASS\t.\tGT\t0/0\t0/0\t0/1\n\
-chr2\t500\t.\tA\tG\t60\tPASS\t.\tGT\t1/1\t0/1\t0/0\n\
-";
-
-/// Write VCF to a unique temp file; each call gets a distinct name.
-fn write_vcf(vcf: &str) -> PathBuf {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let tid = std::thread::current().id();
-    let name = format!("rsomics_vcf_tajima_d_{tid:?}_{ts}.vcf");
-    let path = std::env::temp_dir().join(name);
-    let mut f = std::fs::File::create(&path).expect("create temp VCF");
-    f.write_all(vcf.as_bytes()).expect("write");
-    path
-}
-
-// chr1 bin 0 (pos 100, 200): S=2, pi=1.2, D=1.75324
-// chr1 bin 1000 (pos 1100): S=1, pi=1/3, D=-0.933021
-// chr2 bin 0 (pos 500): S=1, pi=0.6, D=1.4451
-//
-// chr2 site 500: S1=1/1, S2=0/1, S3=0/0 → REF=3, ALT=3, p=0.5
-// pi = (6/5)*2*0.5*0.5=0.6; S=1, D = (0.6 - 1/a1) / sqrt(e1) ≈ 1.4451
-const EXPECTED: &str = "\
-CHROM\tBIN_START\tN_SNPS\tTajimaD\n\
-chr1\t0\t2\t1.75324\n\
-chr1\t1000\t1\t-0.933021\n\
-chr2\t0\t1\t1.4451\n\
-";
-
-#[test]
-fn tajima_d_matches_expected() {
-    let path = write_vcf(TEST_VCF);
-    let rows = compute_tajima_d(&path, 1000).unwrap();
-    let mut got = header().to_string();
+fn render(vcf: &str, window_size: u64) -> String {
+    let rows = compute_tajima_d_reader(vcf.as_bytes(), window_size).expect("compute");
+    let mut out = header().to_string();
     for row in &rows {
-        got.push_str(&row.to_text());
+        out.push_str(&row.to_text());
     }
-    assert_eq!(got, EXPECTED, "Tajima's D output differs from expected");
+    out
 }
 
-// ── chr2 site manual verification ───────────────────────────────────────────
+/// (label, window_size, vcf_input, expected_vcftools_output)
+const CASES: &[(&str, u64, &str, &str)] = &[
+    (
+        "missing_gt",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t0/0\t0/1\t./.\nchr1\t200\t.\tG\tC\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t0\t2\t0.941775\n",
+    ),
+    (
+        "half_and_phased",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t0/0\t0/1\t0/.\nchr1\t200\t.\tG\tC\t60\tPASS\t.\tGT\t0|1\t1|1\t0|0\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t0\t2\t0.584729\n",
+    ),
+    (
+        "haploid_skipped",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t0\t1\t0/1\nchr1\t200\t.\tG\tC\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t0\t1\t1.4451\n",
+    ),
+    (
+        "bare_dot_skipped",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t0/1\t.\t1/1\nchr1\t200\t.\tG\tC\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t0\t1\t1.4451\n",
+    ),
+    (
+        "all_missing_leading",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t./.\t./.\t./.\nchr1\t3200\t.\tG\tC\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t3000\t1\t1.4451\n",
+    ),
+    (
+        "multiallelic_skipped",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\nchr1\t100\t.\tA\tT,C\t60\tPASS\t.\tGT\t0/1\t1/2\t0/0\nchr1\t200\t.\tG\tC\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t0\t1\t1.4451\n",
+    ),
+    (
+        "alt_dot_skipped",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\nchr1\t100\t.\tA\t.\t60\tPASS\t.\tGT\t0/0\t0/0\t0/0\nchr1\t200\t.\tG\tC\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t0\t1\t1.4451\n",
+    ),
+    (
+        "gap_windows",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\nchr1\t3100\t.\tG\tC\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t0\t1\t1.4451\nchr1\t1000\t0\tnan\nchr1\t2000\t0\tnan\nchr1\t3000\t1\t1.4451\n",
+    ),
+    (
+        "trailing_mono",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\nchr1\t3100\t.\tG\tC\t60\tPASS\t.\tGT\t0/0\t0/0\t0/0\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t0\t1\t1.4451\nchr1\t1000\t0\tnan\nchr1\t2000\t0\tnan\nchr1\t3000\t0\tnan\n",
+    ),
+    (
+        "trailing_all_missing",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\nchr1\t3100\t.\tG\tC\t60\tPASS\t.\tGT\t./.\t./.\t./.\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t0\t1\t1.4451\nchr1\t1000\t0\tnan\nchr1\t2000\t0\tnan\nchr1\t3000\t0\tnan\n",
+    ),
+    (
+        "leading_mono",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t0/0\t0/0\t0/0\nchr1\t3100\t.\tG\tC\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t3000\t1\t1.4451\n",
+    ),
+    (
+        "single_sample",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t0/1\nchr1\t200\t.\tG\tC\t60\tPASS\t.\tGT\t1/1\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t0\t1\tnan\n",
+    ),
+    (
+        "two_sample",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t0/1\t0/1\nchr1\t200\t.\tG\tC\t60\tPASS\t.\tGT\t0/0\t0/1\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t0\t2\t0.59158\n",
+    ),
+    (
+        "small_freq",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\tS4\tS5\tS6\tS7\tS8\tS9\tS10\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/1\nchr1\t200\t.\tG\tC\t60\tPASS\t.\tGT\t0/1\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t0\t2\t-1.51284\n",
+    ),
+    (
+        "pos_exact_multiple",
+        100,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\nchr1\t200\t.\tG\tC\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t100\t1\t1.4451\nchr1\t200\t1\t1.4451\n",
+    ),
+    (
+        "multi_chrom",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\tS4\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\t0/1\nchr1\t1500\t.\tG\tC\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\t1/1\nchr2\t500\t.\tA\tG\t60\tPASS\t.\tGT\t1/1\t0/1\t0/0\t0/0\nchr2\t4500\t.\tT\tA\t60\tPASS\t.\tGT\t0/1\t0/1\t0/1\t0/0\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t0\t1\t1.44416\nchr1\t1000\t1\t1.1665\nchr2\t0\t1\t1.1665\nchr2\t1000\t0\tnan\nchr2\t2000\t0\tnan\nchr2\t3000\t0\tnan\nchr2\t4000\t1\t1.1665\n",
+    ),
+    (
+        "format_gt_dp",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\tS4\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT:DP\t0|1:30\t1|1:25\t0|0:40\t0/.:10\nchr1\t250\t.\tG\tC\t60\tPASS\t.\tGT:DP\t0/1:30\t./.:0\t1/1:22\t0|1:18\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t0\t2\t1.43081\n",
+    ),
+    (
+        "default_window",
+        10000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\tS4\tS5\nchr1\t500\t.\tA\tT\t60\tPASS\t.\tGT\t0/1\t1/1\t0/0\t0/1\t1/1\nchr1\t8000\t.\tG\tC\t60\tPASS\t.\tGT\t0/0\t0/1\t0/1\t1/1\t0/1\nchr1\t25000\t.\tC\tA\t60\tPASS\t.\tGT\t0/1\t0/0\t1/1\t0/1\t0/0\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t0\t2\t1.74286\nchr1\t10000\t0\tnan\nchr1\t20000\t1\t1.30268\n",
+    ),
+    (
+        "twenty_sample_lowfreq",
+        1000,
+        "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\ts3\ts4\ts5\ts6\ts7\ts8\ts9\ts10\ts11\ts12\ts13\ts14\ts15\ts16\ts17\ts18\ts19\ts20\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/1\nchr1\t300\t.\tG\tC\t60\tPASS\t.\tGT\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1\t0/1\nchr1\t700\t.\tC\tG\t60\tPASS\t.\tGT\t0/0\t0/0\t0/1\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\t0/0\n",
+        "CHROM\tBIN_START\tN_SNPS\tTajimaD\nchr1\t0\t3\t-0.285802\n",
+    ),
+];
 
+// Each case's `expected` was captured from vcftools 0.1.17 `--TajimaD`.
 #[test]
-fn chr2_site_d_value() {
-    // Verify the chr2 bin0 D value separately.
-    // S=1, pi=0.6, n=6 haplotypes; vcftools reports 1.4451
-    let d = rsomics_vcf_tajima_d::tajima_d(0.6, 1, 6);
-    assert!(
-        (d - 1.4451).abs() < 1e-4,
-        "chr2 D: got {d}, expected 1.4451"
-    );
-}
-
-// ── Live vcftools oracle ─────────────────────────────────────────────────────
-
-fn vcftools_version() -> Option<String> {
-    let out = Command::new("vcftools").arg("--version").output().ok()?;
-    let combined =
-        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
-    combined.lines().next().map(str::to_string)
-}
-
-fn skip_unless_vcftools_017() -> Option<()> {
-    vcftools_version()?.contains("0.1.17").then_some(())
-}
-
-fn oracle_tajima_d(vcf: &std::path::Path, window_size: u64) -> Option<String> {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let prefix = std::env::temp_dir().join(format!("rsomics_oracle_td_{ts}"));
-    let status = Command::new("vcftools")
-        .args([
-            "--vcf",
-            vcf.to_str()?,
-            "--TajimaD",
-            &window_size.to_string(),
-            "--out",
-            prefix.to_str()?,
-        ])
-        .status()
-        .ok()?;
-    if !status.success() {
-        return None;
+fn matches_reference_goldens() {
+    for (label, window_size, vcf, expected) in CASES {
+        let got = render(vcf, *window_size);
+        assert_eq!(&got, expected, "case `{label}` diverges from the oracle");
     }
-    let out_path = prefix.with_extension("Tajima.D");
-    std::fs::read_to_string(out_path).ok()
 }
 
+/// vcftools aborts with a fatal error on a polyploid genotype
+/// ("Polyploidy found, and not supported by vcftools"); we mirror that by
+/// refusing the file rather than emitting a fabricated statistic.
 #[test]
-fn live_oracle_tajima_d() {
-    if skip_unless_vcftools_017().is_none() {
-        eprintln!("vcftools 0.1.17 not found — skipping live oracle test");
-        return;
-    }
-    let path = write_vcf(TEST_VCF);
-    let oracle = oracle_tajima_d(&path, 1000).expect("vcftools --TajimaD failed");
-    let rows = compute_tajima_d(&path, 1000).unwrap();
-    let mut got = header().to_string();
-    for row in &rows {
-        got.push_str(&row.to_text());
-    }
-    assert_eq!(got, oracle, "Tajima's D differs from vcftools oracle");
+fn polyploid_is_rejected() {
+    let vcf = "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\nchr1\t100\t.\tA\tT\t60\tPASS\t.\tGT\t0/0/1\t0/1\t1/1\n";
+    assert!(compute_tajima_d_reader(vcf.as_bytes(), 1000).is_err());
 }
